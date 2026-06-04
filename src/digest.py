@@ -11,7 +11,8 @@ from typing import List
 
 from sqlalchemy import select
 
-from src.db import get_session, Mention, Sentiment
+from src.db import get_session
+from src.models import Mention, Sentiment
 from src.settings import Settings, get_settings
 
 logger = logging.getLogger(__name__)

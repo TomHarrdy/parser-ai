@@ -41,9 +41,9 @@ async def mention_exists_by_url(session: AsyncSession, url: str) -> bool:
     return result.scalar() is not None
 
 
-async def mention_exists_by_text_hash(session: AsyncSession, text: str) -> bool:
+async def mention_exists_by_text_hash(session: AsyncSession, raw_text: str) -> bool:
     """Check if a mention with identical text hash already exists (catches reprints)."""
-    h = _hash(text)
+    h = _hash(raw_text)
     result = await session.execute(
         text("SELECT 1 FROM mentions WHERE raw_text_hash = :h LIMIT 1"), {"h": h}
     )
