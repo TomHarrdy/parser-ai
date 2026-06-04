@@ -18,10 +18,8 @@ from uuid import UUID
 
 from langgraph.graph import StateGraph, END
 
+from src.models import Mention, SourceType, Sentiment
 from src.db import (
-    Mention,
-    SourceType,
-    Sentiment,
     get_session,
     mention_exists_by_url,
     mention_exists_by_text_hash,
