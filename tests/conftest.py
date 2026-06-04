@@ -31,6 +31,7 @@ def mock_settings() -> Settings:
         FIRECRAWL_API_KEY="fc-fake-key-for-testing",
         APIFY_API_KEY="apify-fake-key-for-testing",
         YANDEX_MAPS_ORG_ID="",
+        MAX_ARTICLE_AGE_DAYS=7,
     )
 
 

@@ -40,6 +40,12 @@ class Mention(Base):
     ai_summary: Mapped[str | None] = mapped_column(Text, nullable=True)
     sentiment: Mapped[Sentiment | None] = mapped_column(SAEnum(Sentiment), nullable=True)
     is_alert_sent: Mapped[bool] = mapped_column(Boolean, default=False, nullable=False)
+    # Publication date from the original source (e.g. Tavily's published_date).
+    # NULL means the source didn't provide a date (we don't filter these out,
+    # but do log a warning so the operator knows filtering wasn't applied).
+    source_published_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True, index=True
+    )
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), default=lambda: datetime.now(timezone.utc), nullable=False
     )

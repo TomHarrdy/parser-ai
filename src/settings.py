@@ -52,6 +52,11 @@ class Settings(BaseSettings):
     # Yandex Maps organization ID (e.g. "1076439570" from the maps URL)
     yandex_maps_org_id: str = Field(default="", alias="YANDEX_MAPS_ORG_ID")
 
+    # ── Filtering ──────────────────────────────
+    # Discard articles published more than N days ago (prevents evergreen
+    # articles from flooding alerts on every pipeline run).
+    max_article_age_days: int = Field(default=7, alias="MAX_ARTICLE_AGE_DAYS")
+
     # ── Derived ────────────────────────────────
     @property
     def keyword_list(self) -> List[str]:

@@ -42,8 +42,12 @@ def _format_alert(mention: Mention) -> str:
 
     lines.append(f"📡 Источник: `{mention.source_type.value}`")
 
+    if mention.source_published_at:
+        pub_ts = mention.source_published_at.astimezone(timezone.utc).strftime("%Y-%m-%d")
+        lines.append(f"📅 Опубликовано: {pub_ts}")
+
     ts = mention.created_at.astimezone(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
-    lines.append(f"🕐 {ts}")
+    lines.append(f"🕐 Добавлено: {ts}")
 
     return "\n".join(lines)
 

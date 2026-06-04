@@ -53,6 +53,35 @@ class RawMention:
     text: str
     source_type: SourceType
     source_name: str = ""
+    published_at: Optional[datetime] = None  # parsed from source's published_date
+
+
+def _parse_published_date(raw: Optional[str]) -> Optional[datetime]:
+    """Parse Tavily's published_date string (YYYY-MM-DD or ISO) into a UTC datetime.
+
+    Returns None if the string is absent or unparseable.
+    """
+    if not raw:
+        return None
+    for fmt in ("%Y-%m-%dT%H:%M:%S", "%Y-%m-%d"):
+        try:
+            dt = datetime.strptime(raw[:19], fmt)
+            return dt.replace(tzinfo=timezone.utc)
+        except ValueError:
+            continue
+    return None
+
+
+def _is_too_old(published_at: Optional[datetime], max_age_days: int) -> bool:
+    """Return True if the article is older than max_age_days.
+
+    Articles with no published_at are NOT filtered — we log them but let them
+    through so we don't silently drop mentions from sources that don't expose dates.
+    """
+    if published_at is None:
+        return False
+    cutoff = datetime.now(timezone.utc) - timedelta(days=max_age_days)
+    return published_at < cutoff
 
 
 # ── Node: Collect ────────────────────────────────────────
@@ -61,6 +90,8 @@ async def collect_mentions(state: PipelineState) -> PipelineState:
     """Step 1: Fetch mentions from all configured tools."""
     settings = state.settings
     raw: List[RawMention] = []
+
+    max_age = settings.max_article_age_days
 
     # Tavily Search — brand mentions
     if settings.tavily_api_key and settings.company_name:
@@ -71,14 +102,23 @@ async def collect_mentions(state: PipelineState) -> PipelineState:
                 keywords=settings.keyword_list,
                 location=settings.monitoring_location,
             )
+            skipped_old = 0
             for r in results:
+                pub = _parse_published_date(r.get("published_date"))
+                if _is_too_old(pub, max_age):
+                    skipped_old += 1
+                    continue
                 raw.append(RawMention(
                     url=r.get("url"),
                     text=r.get("content") or r.get("raw_content", ""),
                     source_type=SourceType.web,
                     source_name="tavily",
+                    published_at=pub,
                 ))
-            logger.info("Tavily (brand): %d results", len(results))
+            logger.info(
+                "Tavily (brand): %d results, %d skipped (older than %d days)",
+                len(results), skipped_old, max_age,
+            )
         except Exception as e:
             msg = f"Tavily error: {e}"
             logger.error(msg)
@@ -92,14 +132,23 @@ async def collect_mentions(state: PipelineState) -> PipelineState:
                 phrases=settings.search_phrase_list,
                 location=settings.monitoring_location,
             )
+            skipped_old = 0
             for r in phrase_results:
+                pub = _parse_published_date(r.get("published_date"))
+                if _is_too_old(pub, max_age):
+                    skipped_old += 1
+                    continue
                 raw.append(RawMention(
                     url=r.get("url"),
                     text=r.get("content") or r.get("raw_content", ""),
                     source_type=SourceType.web,
                     source_name="tavily_phrase",
+                    published_at=pub,
                 ))
-            logger.info("Tavily (phrases): %d results", len(phrase_results))
+            logger.info(
+                "Tavily (phrases): %d results, %d skipped (older than %d days)",
+                len(phrase_results), skipped_old, max_age,
+            )
         except Exception as e:
             msg = f"Tavily phrases error: {e}"
             logger.error(msg)
@@ -150,7 +199,13 @@ async def collect_mentions(state: PipelineState) -> PipelineState:
             state.errors.append(msg)
 
     state.raw_mentions = [
-        {"url": m.url, "text": m.text, "source_type": m.source_type.value, "source_name": m.source_name}
+        {
+            "url": m.url,
+            "text": m.text,
+            "source_type": m.source_type.value,
+            "source_name": m.source_name,
+            "published_at": m.published_at.isoformat() if m.published_at else None,
+        }
         for m in raw
     ]
     return state
@@ -338,6 +393,15 @@ async def save_and_notify(state: PipelineState) -> PipelineState:
             # For URL-less mentions, use text hash as url_hash to satisfy the
             # NOT NULL UNIQUE constraint. Dedup already ensures we won't insert
             # a duplicate text, so collisions here are not possible in practice.
+            # Parse published_at from ISO string stored in analyzed mention dict
+            pub_str = m.get("published_at")
+            source_published_at: Optional[datetime] = None
+            if pub_str:
+                try:
+                    source_published_at = datetime.fromisoformat(pub_str)
+                except (ValueError, TypeError):
+                    pass
+
             mention = Mention(
                 url=url,
                 url_hash=url_hash(url) if url else text_hash(text),
@@ -347,6 +411,7 @@ async def save_and_notify(state: PipelineState) -> PipelineState:
                 ai_summary=m.get("summary", ""),
                 sentiment=sentiment,
                 is_alert_sent=False,
+                source_published_at=source_published_at,
             )
 
             session.add(mention)
