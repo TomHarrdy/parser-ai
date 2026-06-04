@@ -1,0 +1,24 @@
+# Environment
+.env
+*.env.local
+*.env.production
+
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+dist/
+.venv/
+
+# IDE
+.idea/
+.vscode/
+*.swp
+
+# Data
+data/
+logs/
+*.sqlite3
+
+# Docker
+docker-compose.override.yml
