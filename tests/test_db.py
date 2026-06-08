@@ -1,9 +1,18 @@
 
 """Tests for src/db.py"""
+import uuid
+
 import pytest
 from unittest.mock import AsyncMock, MagicMock
+from sqlalchemy.dialects import postgresql
 from sqlalchemy.ext.asyncio import AsyncSession
-from src.db import url_hash, text_hash, mention_exists_by_url, mention_exists_by_text_hash
+from src.db import (
+    url_hash,
+    text_hash,
+    mention_exists_by_url,
+    mention_exists_by_text_hash,
+    mark_mention_ignored,
+)
 
 class TestHashing:
     def test_url_hash_returns_64_char_hex(self):
@@ -87,3 +96,27 @@ class TestMentionExistsByTextHash:
         mock_session.execute = AsyncMock(return_value=mock_result)
         result = await mention_exists_by_text_hash(mock_session, "New text")
         assert result is False
+
+
+class TestMarkMentionIgnored:
+    @pytest.mark.asyncio
+    async def test_ignored_url_conflict_target_uses_url_hash_index(self):
+        mention_id = uuid.uuid4()
+        mention = MagicMock()
+        mention.id = mention_id
+        mention.url = "https://example.com/review"
+
+        first_result = MagicMock()
+        first_result.scalar_one_or_none.return_value = mention
+
+        mock_session = AsyncMock(spec=AsyncSession)
+        mock_session.execute = AsyncMock(side_effect=[first_result, MagicMock()])
+        mock_session.commit = AsyncMock()
+
+        result = await mark_mention_ignored(mock_session, str(mention_id))
+
+        assert result is mention
+        assert mention.is_ignored is True
+        stmt = mock_session.execute.call_args_list[1].args[0]
+        compiled = str(stmt.compile(dialect=postgresql.dialect()))
+        assert "ON CONFLICT (url_hash) DO NOTHING" in compiled

@@ -33,26 +33,68 @@ async def _run_once() -> None:
             logger.warning("  - %s", e)
 
 
+async def _health_server_task(stop_event: asyncio.Event, port: int = 8080) -> None:
+    """Minimal async HTTP server for Docker HEALTHCHECK.
+
+    Responds to any TCP request with HTTP 200 {"status":"ok"}.
+    Shuts down cleanly when stop_event is set.
+    """
+    body = b'{"status":"ok"}'
+    response = (
+        b"HTTP/1.1 200 OK\r\n"
+        b"Content-Type: application/json\r\n"
+        b"Content-Length: " + str(len(body)).encode() + b"\r\n"
+        b"Connection: close\r\n"
+        b"\r\n"
+    ) + body
+
+    async def _handle(
+        reader: asyncio.StreamReader, writer: asyncio.StreamWriter
+    ) -> None:
+        try:
+            await reader.read(1024)  # consume the incoming request
+            writer.write(response)
+            await writer.drain()
+        except Exception:
+            pass
+        finally:
+            writer.close()
+
+    server = await asyncio.start_server(_handle, "0.0.0.0", port)
+    logger.info("Health-check server listening on port %d", port)
+    async with server:
+        await stop_event.wait()
+    logger.info("Health-check server stopped")
+
+
 async def _run_daemon() -> None:
-    """Run as a daemon with periodic scheduling."""
+    """Run as a daemon with periodic scheduling + Telegram bot polling.
+
+    All three tasks run concurrently via asyncio.gather():
+      - Scheduler: fires pipeline every N minutes + weekly digest on Monday 09:00
+      - Bot polling: listens for inline button callbacks (e.g. 'Not relevant')
+      - Health server: HTTP /health on port 8080 for Docker HEALTHCHECK
+    """
+    import signal
     from apscheduler.schedulers.asyncio import AsyncIOScheduler
+    from src.bot_handler import start_polling
 
     settings = get_settings()
     await init_db(settings)
 
     scheduler = AsyncIOScheduler()
 
-    # Add the monitoring job — next_run_time=datetime.now() triggers immediately on start
+    # Run at the top of every hour (18:00, 19:00, …).
+    # next_run_time=datetime.now() ensures one immediate run on startup too.
     scheduler.add_job(
         _run_once,
-        "interval",
-        minutes=settings.schedule_interval_minutes,
+        "cron",
+        minute=0,
         id="monitor",
         name="Brand mention monitor",
         next_run_time=datetime.now(),
     )
 
-    # Add weekly digest job: Monday at 9:00
     scheduler.add_job(
         _send_digest,
         "cron",
@@ -64,15 +106,33 @@ async def _run_daemon() -> None:
     )
 
     scheduler.start()
-    logger.info(
-        "Daemon started: monitor every %d min, digest every Monday 09:00",
-        settings.schedule_interval_minutes,
-    )
+    logger.info("Daemon started: monitor every hour at :00, digest every Monday 09:00")
+
+    # Graceful shutdown on SIGTERM (Docker stop) and SIGINT (Ctrl+C)
+    stop_event = asyncio.Event()
+
+    def _handle_signal() -> None:
+        logger.info("Shutdown signal received")
+        stop_event.set()
+
+    loop = asyncio.get_event_loop()
+    for sig in (signal.SIGTERM, signal.SIGINT):
+        loop.add_signal_handler(sig, _handle_signal)
+
+    async def _scheduler_task() -> None:
+        await stop_event.wait()
+        scheduler.shutdown()
+        logger.info("Scheduler stopped")
 
     try:
-        await asyncio.Event().wait()  # run forever
-    except (KeyboardInterrupt, SystemExit):
-        scheduler.shutdown()
+        # Run scheduler guard + bot polling + health server concurrently.
+        await asyncio.gather(
+            _scheduler_task(),
+            start_polling(settings),
+            _health_server_task(stop_event),
+            return_exceptions=True,
+        )
+    finally:
         logger.info("Daemon stopped")
 
 

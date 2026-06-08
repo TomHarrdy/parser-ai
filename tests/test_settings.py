@@ -62,6 +62,18 @@ class TestSearchPhraseList:
         assert self._s(SEARCH_PHRASES="").search_phrase_list == []
 
 
+class TestVkTargetList:
+    def _s(self, **kw):
+        return Settings(_env_file=None, DATABASE_URL="postgresql+asyncpg://u:p@h/db", **kw)
+
+    def test_multiple_targets(self):
+        s = self._s(VK_TARGETS="pogruzhenye.official, https://vk.com/another")
+        assert s.vk_target_list == ["pogruzhenye.official", "https://vk.com/another"]
+
+    def test_empty_targets(self):
+        assert self._s(VK_TARGETS="").vk_target_list == []
+
+
 class TestLanguageList:
     def _s(self, **kw):
         return Settings(_env_file=None, DATABASE_URL="postgresql+asyncpg://u:p@h/db", **kw)

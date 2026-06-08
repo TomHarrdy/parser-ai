@@ -32,6 +32,7 @@ class Settings(BaseSettings):
 
     # ── Brand ──────────────────────────────────
     company_name: str = Field(default="", alias="COMPANY_NAME")
+    company_description: str = Field(default="", alias="COMPANY_DESCRIPTION")
     keywords: str = Field(default="", alias="KEYWORDS")
     search_phrases: str = Field(default="", alias="SEARCH_PHRASES")
     monitoring_location: str = Field(default="Москва", alias="MONITORING_LOCATION")
@@ -46,9 +47,28 @@ class Settings(BaseSettings):
     # ── Tools ──────────────────────────────────
     tavily_api_key: str = Field(default="", alias="TAVILY_API_KEY")
     firecrawl_api_key: str = Field(default="", alias="FIRECRAWL_API_KEY")
+    enable_firecrawl_fallback: bool = Field(default=False, alias="ENABLE_FIRECRAWL_FALLBACK")
     apify_api_key: str = Field(default="", alias="APIFY_API_KEY")
+    jina_reader_base_url: str = Field(default="https://r.jina.ai", alias="JINA_READER_BASE_URL")
+    enable_searxng: bool = Field(default=False, alias="ENABLE_SEARXNG")
+    searxng_base_url: str = Field(default="http://searxng:8080", alias="SEARXNG_BASE_URL")
+
+    # ── VK Direct (альтернатива Apify) ────────────────
+    vk_access_token: str = Field(default="", alias="VK_ACCESS_TOKEN")
+
+    # ── Instagram Direct (Instaloader) ────────────────
+    enable_instagram: bool = Field(default=False, alias="ENABLE_INSTAGRAM")
+    instagram_targets: str = Field(default="", alias="INSTAGRAM_TARGETS")
+    instagram_max_posts: int = Field(default=5, alias="INSTAGRAM_MAX_POSTS")
+    instagram_max_comments: int = Field(default=20, alias="INSTAGRAM_MAX_COMMENTS")
+    instagram_session_username: str = Field(default="", alias="INSTAGRAM_SESSION_USERNAME")
+    instagram_session_file: str = Field(default="", alias="INSTAGRAM_SESSION_FILE")
 
     # ── Apify Actors ───────────────────────────
+    # Comma-separated VK handles or URLs to monitor via VK posts scraper.
+    # Example: "pogruzhenye.official,https://vk.com/company_page"
+    vk_targets: str = Field(default="", alias="VK_TARGETS")
+
     # Yandex Maps organization ID (e.g. "1076439570" from the maps URL)
     yandex_maps_org_id: str = Field(default="", alias="YANDEX_MAPS_ORG_ID")
 
@@ -57,7 +77,40 @@ class Settings(BaseSettings):
     # articles from flooding alerts on every pipeline run).
     max_article_age_days: int = Field(default=7, alias="MAX_ARTICLE_AGE_DAYS")
 
+    # How far back Tavily should search (days). Should be <= max_article_age_days.
+    tavily_search_days: int = Field(default=1, alias="TAVILY_SEARCH_DAYS")
+
+    # Which sentiments trigger a Telegram alert.
+    # Allowed values: "all" | "negative_only" | "negative_neutral"
+    alert_on_sentiment: str = Field(default="all", alias="ALERT_ON_SENTIMENT")
+
+    # High-water mark: how many minutes before the previous run's timestamp
+    # to re-check (overlap buffer). Protects against indexing delays.
+    # Set to 0 to disable overlap (strict watermark).
+    watermark_overlap_minutes: int = Field(default=60, alias="WATERMARK_OVERLAP_MINUTES")
+
+    # Comma-separated list of source_name values that use content-hash change
+    # detection instead of (or in addition to) watermark date filtering.
+    # These sources have pages whose published_at never changes but content
+    # grows over time (new comments, new reviews, discussion threads).
+    dynamic_sources: str = Field(
+        default="vk,yandex_maps",
+        alias="DYNAMIC_SOURCES",
+    )
+
+    @property
+    def dynamic_source_list(self) -> List[str]:
+        return [s.strip() for s in self.dynamic_sources.split(",") if s.strip()]
+
     # ── Derived ────────────────────────────────
+    @property
+    def vk_target_list(self) -> List[str]:
+        return [target.strip() for target in self.vk_targets.split(",") if target.strip()]
+
+    @property
+    def instagram_target_list(self) -> List[str]:
+        return [target.strip() for target in self.instagram_targets.split(",") if target.strip()]
+
     @property
     def keyword_list(self) -> List[str]:
         if not self.keywords.strip():

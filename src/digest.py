@@ -53,6 +53,7 @@ async def _fetch_week_mentions() -> List[dict]:
         result = await session.execute(
             select(Mention)
             .where(Mention.created_at >= cutoff)
+            .where(Mention.is_ignored.is_(False))   # exclude operator-dismissed mentions
             .order_by(Mention.created_at.desc())
         )
         mentions = result.scalars().all()
@@ -118,31 +119,64 @@ async def generate_digest(settings: Settings = None) -> str:
     return header + content
 
 
+def _split_digest(text: str, max_len: int = 4000) -> List[str]:
+    """Split digest text into parts no longer than max_len, breaking at paragraph boundaries.
+
+    Tries to break on double-newlines (\\n\\n) to preserve Markdown structure.
+    Falls back to single-newline splits, and finally hard-cuts if a single
+    paragraph exceeds max_len.
+    """
+    if len(text) <= max_len:
+        return [text]
+
+    parts: List[str] = []
+    current = ""
+
+    for paragraph in text.split("\n\n"):
+        block = paragraph + "\n\n"
+        if len(current) + len(block) <= max_len:
+            current += block
+        else:
+            if current:
+                parts.append(current.rstrip())
+            # If a single paragraph is too long, hard-cut it
+            while len(block) > max_len:
+                parts.append(block[:max_len])
+                block = block[max_len:]
+            current = block
+
+    if current.strip():
+        parts.append(current.rstrip())
+
+    return parts or [text[:max_len]]
+
+
 async def send_weekly_digest(settings: Settings = None) -> None:
     """Generate and send the weekly digest to Telegram."""
     if settings is None:
         settings = get_settings()
 
-    if not settings.telegram_bot_token or not settings.telegram_target_chat_id:
+    if not settings.telegram_bot_token:
         logger.warning("Telegram not configured, cannot send digest")
+        return
+
+    from src.telegram import _bot_session, resolve_telegram_chat_ids
+
+    chat_ids = await resolve_telegram_chat_ids(settings)
+    if not chat_ids:
+        logger.warning("No Telegram target chats configured, cannot send digest")
         return
 
     digest_text = await generate_digest(settings)
 
-    from src.telegram import _bot_session
-
     # Reuse a single Bot HTTP session for all parts of the digest
     async with _bot_session(settings) as bot:
-        # Split long messages if needed (Telegram hard limit is 4096 chars)
-        max_len = 4000
-        parts = (
-            [digest_text]
-            if len(digest_text) <= max_len
-            else [digest_text[i : i + max_len] for i in range(0, len(digest_text), max_len)]
-        )
-        for part in parts:
-            await bot.send_message(
-                chat_id=settings.telegram_target_chat_id,
-                text=part,
-            )
-        logger.info("Weekly digest sent (%d part(s))", len(parts))
+        # Split long messages at paragraph boundaries to avoid cutting Markdown mid-block
+        parts = _split_digest(digest_text, max_len=4000)
+        for chat_id in chat_ids:
+            for part in parts:
+                await bot.send_message(
+                    chat_id=chat_id,
+                    text=part,
+                )
+        logger.info("Weekly digest sent to %d chat(s), %d part(s)", len(chat_ids), len(parts))
