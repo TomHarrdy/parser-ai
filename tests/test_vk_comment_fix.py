@@ -6,6 +6,7 @@ Covers four bugs fixed in this session:
   Bug 3 — VK comment URL used from_id (author) instead of owner_id (page)
   Bug 4 — Python post-LLM check silently dropped vk_comment even with trusted date
 """
+import json
 from datetime import datetime, timezone, timedelta
 from unittest.mock import AsyncMock, MagicMock, patch
 
@@ -15,6 +16,7 @@ from src.tools.vk_direct import VKDirectClient
 from src.agent import (
     ANALYZE_USER_PROMPT,
     TRUSTED_SOURCE_DATE_NAMES,
+    ALWAYS_RELEVANT_SOURCES,
     _parse_published_date,
 )
 
@@ -220,4 +222,108 @@ class TestTrustedSourceDateNames:
 
     def test_instagram_comment_is_trusted(self):
         assert "instagram_comment" in TRUSTED_SOURCE_DATE_NAMES
+
+
+# ---------------------------------------------------------------------------
+# ALWAYS_RELEVANT_SOURCES: official owned channels bypass is_relevant check
+# ---------------------------------------------------------------------------
+
+class TestAlwaysRelevantSources:
+    """Official sources must publish ALL new content regardless of LLM verdict."""
+
+    def test_vk_comment_is_always_relevant(self):
+        """Comments on the brand's own VK page are always published."""
+        assert "vk_comment" in ALWAYS_RELEVANT_SOURCES
+
+    def test_regular_web_not_always_relevant(self):
+        """Regular web search results still go through LLM relevance filter."""
+        assert "tavily" not in ALWAYS_RELEVANT_SOURCES
+        assert "web" not in ALWAYS_RELEVANT_SOURCES
+        assert "searxng" not in ALWAYS_RELEVANT_SOURCES
+
+    @pytest.mark.asyncio
+    async def test_analyze_with_llm_force_relevant_overrides_false(self, mock_settings):
+        """When force_relevant=True, is_relevant in result must be True even if
+        LLM returns is_relevant=false."""
+        llm_response = json.dumps({
+            "is_relevant": False,  # LLM says not relevant
+            "event_type": "comment",
+            "sentiment": "positive",
+            "reason": "приятный визит",
+            "summary": "Гость остался доволен.",
+        })
+
+        mock_choice = MagicMock()
+        mock_choice.message.content = llm_response
+        mock_completion = MagicMock()
+        mock_completion.choices = [mock_choice]
+
+        mock_client = AsyncMock()
+        mock_client.chat.completions.create = AsyncMock(return_value=mock_completion)
+
+        from src.agent import analyze_with_llm
+        with patch("openai.AsyncOpenAI", return_value=mock_client), \
+             patch("src.agent._load_lessons", new=AsyncMock(return_value=[])):
+            result = await analyze_with_llm(
+                mock_settings,
+                text="Всё понравилось!",
+                force_relevant=True,
+            )
+
+        # Despite LLM returning is_relevant=false, result must be True
+        assert result["is_relevant"] is True
+        assert result["sentiment"] == "positive"
+        assert result["summary"] == "Гость остался доволен."
+
+    @pytest.mark.asyncio
+    async def test_analyze_with_llm_no_force_respects_llm_false(self, mock_settings):
+        """Without force_relevant, is_relevant=false from LLM must be preserved."""
+        llm_response = json.dumps({
+            "is_relevant": False,
+            "event_type": "article",
+            "sentiment": "neutral",
+            "reason": None,
+            "summary": "",
+        })
+
+        mock_choice = MagicMock()
+        mock_choice.message.content = llm_response
+        mock_completion = MagicMock()
+        mock_completion.choices = [mock_choice]
+
+        mock_client = AsyncMock()
+        mock_client.chat.completions.create = AsyncMock(return_value=mock_completion)
+
+        from src.agent import analyze_with_llm
+        with patch("openai.AsyncOpenAI", return_value=mock_client), \
+             patch("src.agent._load_lessons", new=AsyncMock(return_value=[])):
+            result = await analyze_with_llm(
+                mock_settings,
+                text="Какой-то текст про другую компанию",
+                force_relevant=False,
+            )
+
+        assert result["is_relevant"] is False
+
+    @pytest.mark.asyncio
+    async def test_analyze_with_llm_json_error_force_relevant_returns_true(self, mock_settings):
+        """Even on JSON parse error, force_relevant must keep is_relevant=True."""
+        mock_choice = MagicMock()
+        mock_choice.message.content = "NOT VALID JSON AT ALL"
+        mock_completion = MagicMock()
+        mock_completion.choices = [mock_choice]
+
+        mock_client = AsyncMock()
+        mock_client.chat.completions.create = AsyncMock(return_value=mock_completion)
+
+        from src.agent import analyze_with_llm
+        with patch("openai.AsyncOpenAI", return_value=mock_client), \
+             patch("src.agent._load_lessons", new=AsyncMock(return_value=[])):
+            result = await analyze_with_llm(
+                mock_settings,
+                text="Короткий комментарий",
+                force_relevant=True,
+            )
+
+        assert result["is_relevant"] is True
 

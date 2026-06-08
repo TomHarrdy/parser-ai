@@ -61,6 +61,12 @@ logger = logging.getLogger(__name__)
 
 TRUSTED_SOURCE_DATE_NAMES = {"vk", "vk_comment", "instagram", "instagram_comment"}
 
+# Sources where ALL new content is always published without LLM relevance check.
+# These are official owned channels of the brand — every new comment/post there
+# is relevant by definition. LLM still runs for sentiment + summary, but the
+# is_relevant field returned by LLM is ignored for these sources.
+ALWAYS_RELEVANT_SOURCES = {"vk_comment"}
+
 
 # ── State ────────────────────────────────────────────────
 
@@ -1087,8 +1093,15 @@ async def analyze_with_llm(
     settings: Settings,
     text: str,
     published_at: Optional[datetime] = None,
+    force_relevant: bool = False,
 ) -> Dict[str, Any]:
     """Call LLM to analyze a mention text.
+
+    Args:
+        force_relevant: If True the mention comes from an official owned source
+            (e.g. comments on the brand's own VK page). The LLM still runs for
+            sentiment + summary, but is_relevant is forced to True regardless of
+            what the model returns. Use for ALWAYS_RELEVANT_SOURCES.
 
     Uses structured system prompt (company profile + learned lessons from human
     feedback) and a user prompt (text to analyze). This separation allows the
@@ -1114,6 +1127,17 @@ async def analyze_with_llm(
     now = datetime.now(timezone.utc)
     cutoff = now - timedelta(days=settings.max_article_age_days)
     system_prompt = build_system_prompt(settings, lessons)
+
+    # For official sources we tell the LLM up front that relevance is guaranteed
+    # so it focuses on sentiment / summary quality rather than trying to filter.
+    official_hint = (
+        "\n\nIMPORTANT: This content comes from the brand's OFFICIAL channel "
+        "(e.g. a comment on the company's own VK page). It is ALWAYS relevant. "
+        "Set is_relevant=true unconditionally. Focus on sentiment and summary."
+        if force_relevant
+        else ""
+    )
+
     user_prompt = ANALYZE_USER_PROMPT.format(
         text=text[:4000],
         current_date=now.strftime("%Y-%m-%d"),
@@ -1121,7 +1145,7 @@ async def analyze_with_llm(
         source_published_at=(
             published_at.strftime("%Y-%m-%d") if published_at else "unknown"
         ),
-    )
+    ) + official_hint
 
     resp = await client.chat.completions.create(
         model=settings.llm_model,
@@ -1146,10 +1170,16 @@ async def analyze_with_llm(
         if match:
             result = json.loads(match.group())
         else:
-            return {"is_relevant": False, "sentiment": "neutral", "reason": None, "summary": raw[:200]}
+            return {
+                "is_relevant": True if force_relevant else False,
+                "sentiment": "neutral",
+                "reason": None,
+                "summary": raw[:200],
+            }
 
     # Normalize
-    is_relevant = bool(result.get("is_relevant", False))
+    # Official sources are always relevant regardless of what LLM returns.
+    is_relevant = True if force_relevant else bool(result.get("is_relevant", False))
 
     sentiment = str(result.get("sentiment", "neutral")).lower()
     if sentiment not in ("positive", "negative", "neutral"):
@@ -1272,16 +1302,30 @@ async def _analyze_single(
             return None, None
 
         # LLM analysis
+        source_name = m.get("source_name", "")
+        is_always_relevant = source_name in ALWAYS_RELEVANT_SOURCES
         try:
-            analysis = await analyze_with_llm(settings, text, published_at=published_at)
+            analysis = await analyze_with_llm(
+                settings,
+                text,
+                published_at=published_at,
+                force_relevant=is_always_relevant,
+            )
 
-            # Skip irrelevant mentions — they matched keywords but are not about the brand
-            if not analysis.get("is_relevant", True):
+            # Skip irrelevant mentions — they matched keywords but are not about the brand.
+            # Official sources (ALWAYS_RELEVANT_SOURCES) are never skipped here because
+            # force_relevant=True already sets is_relevant=True inside analyze_with_llm.
+            if is_always_relevant:
+                logger.info(
+                    "Official source (%s) — relevance check bypassed: %s",
+                    source_name,
+                    url or "no-url",
+                )
+            elif not analysis.get("is_relevant", True):
                 logger.info("Skipped (not relevant): %s", url or "no-url")
                 return None, None
 
             event_type = analysis.get("event_type", "mention")
-            source_name = m.get("source_name", "")
             # Trusted sources (VK, Instagram) provide their own timestamps —
             # do NOT skip them just because we couldn't resolve a date via
             # page-extraction. Only apply the hard date-gate for untrusted
