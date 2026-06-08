@@ -1215,6 +1215,9 @@ async def _analyze_single(
     async with semaphore:
         text = m.get("text", "")
         url = m.get("url")
+        source_name = m.get("source_name", "")
+        is_always_relevant = source_name in ALWAYS_RELEVANT_SOURCES
+
         published_at = _coerce_published_at(m.get("published_at"))
         if published_at is None and url and "instagram.com/" in url:
             published_at = extract_first_content_date(text)
@@ -1222,11 +1225,16 @@ async def _analyze_single(
                 m["published_at"] = published_at.isoformat()
                 logger.debug("Instagram date extracted from snippet for %s: %s", url, published_at)
 
-        # If text is too short, or source date is missing, deep-read the URL.
-        # Review pages often have per-comment dates in visible page content even
-        # when the search result has no published_date metadata.
+        # Official sources (ALWAYS_RELEVANT_SOURCES) already carry a trusted API
+        # timestamp from the collector. Skip deep-read entirely:
+        #   1. The date is already correct from VK/Instagram API.
+        #   2. The text is already enriched with parent-post context.
+        #   3. Scraping the post page could return the parent post's (old) date
+        #      and accidentally override published_at, causing the freshness
+        #      check below to wrongly drop the comment.
         needs_deep_read = (
-            not m.get("freshness_verified")
+            not is_always_relevant
+            and not m.get("freshness_verified")
             and (len(text) < 200 or published_at is None)
         )
         if url and needs_deep_read:
@@ -1266,44 +1274,59 @@ async def _analyze_single(
             except Exception:
                 pass
 
-        if (
-            not m.get("is_content_update")
-            and _is_too_old(published_at, settings.max_article_age_days)
-        ):
-            await _archive_for_freshness(
-                url,
-                text,
-                m.get("source_name", ""),
-                published_at,
-                "old_publication",
-            )
-            logger.info("Skipped (too old: %s): %s", published_at, url or "no-url")
-            return None, None
-
-        freshness = decide_freshness(
-            published_at,
-            settings.max_article_age_days,
-            is_content_update=bool(m.get("is_content_update")),
-        )
-        if not freshness.should_alert:
-            await _archive_for_freshness(
-                url,
-                text,
-                m.get("source_name", ""),
-                published_at,
-                freshness.status,
-            )
-            logger.info(
-                "Skipped (freshness=%s, date=%s): %s",
-                freshness.status,
-                published_at,
+        # Official sources: skip age/freshness gates entirely.
+        # The watermark in the collector already guarantees we only see new content.
+        # Applying _is_too_old or decide_freshness here would wrongly drop comments
+        # whose API-timestamp happens to be a few days old (e.g. posted during a gap
+        # when the bot was down) but that we haven't processed yet.
+        if is_always_relevant:
+            logger.debug(
+                "Official source (%s) — freshness gate skipped: %s",
+                source_name,
                 url or "no-url",
             )
-            return None, None
+            freshness = decide_freshness(
+                published_at,
+                settings.max_article_age_days,
+                is_content_update=bool(m.get("is_content_update")),
+            )
+        else:
+            if (
+                not m.get("is_content_update")
+                and _is_too_old(published_at, settings.max_article_age_days)
+            ):
+                await _archive_for_freshness(
+                    url,
+                    text,
+                    source_name,
+                    published_at,
+                    "old_publication",
+                )
+                logger.info("Skipped (too old: %s): %s", published_at, url or "no-url")
+                return None, None
+
+            freshness = decide_freshness(
+                published_at,
+                settings.max_article_age_days,
+                is_content_update=bool(m.get("is_content_update")),
+            )
+            if not freshness.should_alert:
+                await _archive_for_freshness(
+                    url,
+                    text,
+                    source_name,
+                    published_at,
+                    freshness.status,
+                )
+                logger.info(
+                    "Skipped (freshness=%s, date=%s): %s",
+                    freshness.status,
+                    published_at,
+                    url or "no-url",
+                )
+                return None, None
 
         # LLM analysis
-        source_name = m.get("source_name", "")
-        is_always_relevant = source_name in ALWAYS_RELEVANT_SOURCES
         try:
             analysis = await analyze_with_llm(
                 settings,
