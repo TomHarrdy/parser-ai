@@ -26,6 +26,24 @@ class TestSettingsDefaults:
         assert s.llm_api_key == ""
         assert s.tavily_api_key == ""
         assert s.firecrawl_api_key == ""
+        assert s.exa_api_key == ""
+        assert s.enable_exa_search is False
+
+    def test_exa_settings(self):
+        s = self._s(
+            EXA_API_KEY="exa-key",
+            ENABLE_EXA_SEARCH=True,
+            ENABLE_EXA_CONTENTS_FALLBACK=True,
+            EXA_SEARCH_TYPE="fast",
+            EXA_MAX_AGE_HOURS=6,
+            PROVIDER_METRICS_PATH="data/test-provider-metrics.jsonl",
+        )
+        assert s.exa_api_key == "exa-key"
+        assert s.enable_exa_search is True
+        assert s.enable_exa_contents_fallback is True
+        assert s.exa_search_type == "fast"
+        assert s.exa_max_age_hours == 6
+        assert s.provider_metrics_path == "data/test-provider-metrics.jsonl"
 
 
 class TestKeywordList:

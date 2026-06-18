@@ -26,8 +26,9 @@
 | Telegram bot | aiogram v3 |
 | БД | PostgreSQL 16 + SQLAlchemy 2 (async) + asyncpg |
 | LLM | DeepSeek Chat (через OpenAI-совместимый API), настраивается через `.env` |
-| Веб-поиск | SearXNG (self-hosted в Docker) |
+| Веб-поиск | SearXNG (self-hosted в Docker), optional Exa Search, legacy Tavily |
 | Парсинг страниц | trafilatura → Jina Reader → Firecrawl (каскад, free-first) |
+| Мониторинг эффективности источников | JSONL snapshot в `data/provider_effectiveness.jsonl` |
 | ВКонтакте | Прямой VK API (без Apify), `vk_direct.py` |
 | Яндекс.Карты | Apify actor (`drobnikj/yandex-maps-reviews-scraper`) |
 | Instagram | Instaloader (опционально, выключен в `.env`) |
@@ -67,6 +68,7 @@ parser-ai/
 │       ├── __init__.py       ← Реэкспорт публичного API tools
 │       ├── page_extract.py   ← Каскадный парсер страниц (trafilatura→Jina→Firecrawl)
 │       ├── searxng.py        ← Поиск через self-hosted SearXNG
+│       ├── exa.py            ← Optional Exa Search/Contents provider
 │       ├── tavily.py         ← Поиск через Tavily API (платный, сейчас лимит исчерпан)
 │       ├── vk_direct.py      ← Прямой VK API: стена, комментарии, поиск
 │       ├── apify.py          ← Apify actors: VK + Яндекс.Карты
@@ -141,6 +143,8 @@ Pipeline реализован как **LangGraph StateGraph** из 5 нод, в�
 Параллельно (`asyncio.gather`) собирает данные из всех источников:
 - **SearXNG brand** — поиск по названию бренда + ключевым словам
 - **SearXNG phrases** — поиск по фразам (`SEARCH_PHRASES`) + бренд
+- **Exa brand** — optional AI-native semantic search по бренду + ключевым словам (`ENABLE_EXA_SEARCH=true`)
+- **Exa phrases** — optional semantic search по мониторинговым фразам; результаты идут через те же freshness/dedup/LLM gates
 - **Tavily brand** — платный поиск (сейчас лимит исчерпан, HTTP 432)
 - **Tavily phrases** — платный поиск по фразам
 - **VK Direct** — стена паблика `pogruzhenye.official` + комментарии к постам
@@ -172,6 +176,32 @@ Pipeline реализован как **LangGraph StateGraph** из 5 нод, в�
 - Отправляет Telegram-алерты (фильтр по `ALERT_ON_SENTIMENT`)
 - На каждом алерте кнопка **«❌ Не касается нас»**
 - Обновляет watermark в `run_checkpoints`
+- Пишет snapshot эффективности provider'ов в `PROVIDER_METRICS_PATH`
+
+### Мониторинг эффективности Exa / web providers
+
+Exa добавлен как **дополнительный контур**, а не замена текущего поиска.
+
+Флаги:
+
+```bash
+EXA_API_KEY=
+ENABLE_EXA_SEARCH=false
+ENABLE_EXA_CONTENTS_FALLBACK=false
+EXA_SEARCH_TYPE=auto
+EXA_MAX_AGE_HOURS=24
+PROVIDER_METRICS_PATH=data/provider_effectiveness.jsonl
+```
+
+Правила эксплуатации:
+
+- включать Exa сначала в shadow/A-B режиме, сравнивая с `tavily`, `tavily_phrase`, `searxng`, `searxng_phrase`;
+- Exa results всегда проходят текущие `verify_freshness`, `deduplicate`, `analyze_mentions`, `save_and_notify`;
+- `publishedDate` от Exa не считать единственным доказательством свежести;
+- `ENABLE_EXA_CONTENTS_FALLBACK=true` включает Exa Contents только как fallback, если текст короткий или дата не найдена;
+- эффективность смотреть по JSONL snapshot: `collected`, `freshness_verified`, `freshness_skipped`, `dedup_new`, `dedup_skipped`, `analyzed_relevant`, `analysis_skipped`, `saved`, `notified`, `errors`, `duration_ms`;
+- быстрый отчёт: `python scripts/provider_metrics_summary.py --last 50`;
+- решение оставлять/отключать Exa принимать по incremental fresh relevant mentions, stale/noise rate, latency and cost per accepted alert.
 
 ---
 
@@ -231,6 +261,12 @@ LLM_MODEL=deepseek-chat
 TAVILY_API_KEY=...       # СЕЙЧАС НЕ РАБОТАЕТ (HTTP 432 — лимит исчерпан)
 ENABLE_SEARXNG=true
 SEARXNG_BASE_URL=http://searxng:8080
+EXA_API_KEY=             # optional Exa free-tier key
+ENABLE_EXA_SEARCH=false  # Exa как дополнительный search provider
+ENABLE_EXA_CONTENTS_FALLBACK=false
+EXA_SEARCH_TYPE=auto
+EXA_MAX_AGE_HOURS=24
+PROVIDER_METRICS_PATH=data/provider_effectiveness.jsonl
 APIFY_API_KEY=           # пусто — Apify отключён
 VK_ACCESS_TOKEN=...      # прямой VK API (работает)
 VK_TARGETS=pogruzhenye.official
@@ -416,4 +452,3 @@ docker compose -f /root/parser-ai/docker/docker-compose.yml down
   - Tavily API (HTTP 432) — лимит бесплатного тиера исчерпан. Поиск идёт через SearXNG. Нужно пополнить аккаунт на tavily.com
   - Apify не настроен (`APIFY_API_KEY` пустой) — Яндекс.Карты не парсятся
   - 0 новых упоминаний сохраняется — большинство найденных URL старше `MAX_ARTICLE_AGE_DAYS=7`. Нормально для первых прогонов, нужно наблюдать динамику
-

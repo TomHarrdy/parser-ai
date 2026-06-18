@@ -6,6 +6,7 @@ from unittest.mock import AsyncMock, MagicMock, patch
 from src.agent import (
     PipelineState, collect_mentions, deduplicate, analyze_mentions, analyze_with_llm,
     verify_freshness, _parse_published_date, _is_too_old,
+    _metric_add, _write_provider_metrics_snapshot,
 )
 
 POS_RESP = json.dumps({"sentiment": "positive", "reason": "good", "summary": "Great."})
@@ -85,7 +86,7 @@ class TestCollectMentions:
         fake_vk = [{
             "sourceUrl": "https://vk.com/wall-104950814_8340",
             "text": "Свежий пост Погружение",
-            "postedAt": "2026-06-07T20:01:24.000Z",
+            "postedAt": datetime.now(timezone.utc).isoformat(),
         }]
         with patch("src.agent.search_brand_mentions", new=AsyncMock(return_value=[])), \
              patch("src.agent.search_monitoring_phrases", new=AsyncMock(return_value=[])), \
@@ -94,14 +95,14 @@ class TestCollectMentions:
             result = await collect_mentions(PipelineState(settings=mock_settings))
 
         assert vk.call_args.kwargs["targets"] == ["pogruzhenye.official"]
-        assert result.raw_mentions == [{
-            "url": "https://vk.com/wall-104950814_8340",
-            "text": "Свежий пост Погружение",
-            "source_type": "vk",
-            "source_name": "vk",
-            "published_at": "2026-06-07T20:01:24+00:00",
-            "is_content_update": False,
-        }]
+        assert len(result.raw_mentions) == 1
+        mention = result.raw_mentions[0]
+        assert mention["url"] == "https://vk.com/wall-104950814_8340"
+        assert mention["text"] == "Свежий пост Погружение"
+        assert mention["source_type"] == "vk"
+        assert mention["source_name"] == "vk"
+        assert mention["published_at"] is not None
+        assert mention["is_content_update"] is False
 
     @pytest.mark.asyncio
     async def test_skips_apify_vk_when_direct_vk_token_is_configured(self, mock_settings):
@@ -184,10 +185,10 @@ class TestCollectMentions:
         state = PipelineState(settings=mock_settings)
         with patch("src.agent._load_watermark", new=AsyncMock(return_value=None)), \
              patch("src.agent.search_searxng_brand_mentions", new=AsyncMock(return_value=[{
-                 "url": "https://web.example.com",
-                 "content": "SearXNG mention",
-                 "published_date": "2026-06-08",
-             }])), \
+            "url": "https://web.example.com",
+            "content": "SearXNG mention",
+            "published_date": datetime.now(timezone.utc).strftime("%Y-%m-%d"),
+        }])), \
              patch("src.agent.search_searxng_monitoring_phrases", new=AsyncMock(return_value=[])), \
              patch("src.agent.search_brand_mentions", new=AsyncMock(return_value=[])), \
              patch("src.agent.search_monitoring_phrases", new=AsyncMock(return_value=[])), \
@@ -210,11 +211,11 @@ class TestCollectMentions:
              patch("src.agent.search_vk_direct", new=AsyncMock(return_value=[])), \
              patch("src.agent.get_yandex_maps_reviews", new=AsyncMock(return_value=[])), \
              patch("src.agent.search_instagram_profiles", new=AsyncMock(return_value=[{
-                 "url": "https://www.instagram.com/p/ABC123/",
-                 "text": "Instagram mention",
-                 "published_date": "2026-06-08T10:00:00+00:00",
-                 "source": "instagram",
-             }])):
+                "url": "https://www.instagram.com/p/ABC123/",
+                "text": "Instagram mention",
+                "published_date": datetime.now(timezone.utc).isoformat(),
+                "source": "instagram",
+            }])):
             result = await collect_mentions(state)
 
         assert any(m["source_name"] == "instagram" for m in result.raw_mentions)
@@ -228,6 +229,47 @@ class TestCollectMentions:
              patch("src.agent.get_yandex_maps_reviews", new=AsyncMock(return_value=[])):
             await collect_mentions(PipelineState(settings=mock_settings))
         mock_s.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_collects_exa_when_enabled(self, mock_settings):
+        mock_settings.enable_exa_search = True
+        mock_settings.exa_api_key = "exa-fake-key"
+        state = PipelineState(settings=mock_settings)
+        with patch("src.agent._load_watermark", new=AsyncMock(return_value=None)), \
+             patch("src.agent.search_exa_brand_mentions", new=AsyncMock(return_value=[{
+                 "url": "https://exa.example.com",
+                 "content": "Exa mention",
+                 "published_date": "2026-06-18",
+             }])), \
+             patch("src.agent.search_exa_monitoring_phrases", new=AsyncMock(return_value=[])), \
+             patch("src.agent.search_brand_mentions", new=AsyncMock(return_value=[])), \
+             patch("src.agent.search_monitoring_phrases", new=AsyncMock(return_value=[])), \
+             patch("src.agent.search_searxng_brand_mentions", new=AsyncMock(return_value=[])), \
+             patch("src.agent.search_searxng_monitoring_phrases", new=AsyncMock(return_value=[])), \
+             patch("src.agent.search_vk", new=AsyncMock(return_value=[])), \
+             patch("src.agent.search_vk_direct", new=AsyncMock(return_value=[])), \
+             patch("src.agent.get_yandex_maps_reviews", new=AsyncMock(return_value=[])):
+            result = await collect_mentions(state)
+
+        assert any(m["source_name"] == "exa" for m in result.raw_mentions)
+        assert result.provider_metrics["exa"]["collected"] == 1
+
+
+class TestProviderMetrics:
+    def test_writes_provider_metrics_snapshot(self, mock_settings, tmp_path):
+        metrics_path = tmp_path / "provider_effectiveness.jsonl"
+        mock_settings.provider_metrics_path = str(metrics_path)
+        state = PipelineState(settings=mock_settings)
+        _metric_add(state, "exa", "collected", 2)
+        _metric_add(state, "exa", "freshness_verified", 1)
+        _metric_add(state, "exa", "saved", 1)
+
+        _write_provider_metrics_snapshot(state)
+
+        payload = json.loads(metrics_path.read_text().strip())
+        assert payload["providers"]["exa"]["collected"] == 2
+        assert payload["providers"]["exa"]["freshness_verified"] == 1
+        assert payload["total"]["saved"] == 1
 
 
 class TestDeduplicate:

@@ -20,6 +20,7 @@ AI-агент для мониторинга упоминаний бренда в
 Получи API-ключи:
 - [Tavily](https://tavily.com) — поиск по вебу
 - SearXNG — бесплатный self-host fallback для поиска по вебу
+- [Exa](https://exa.ai) — optional AI-native web search / contents provider
 - [Jina Reader](https://jina.ai/reader/) — бесплатный fallback для глубокого чтения страниц
 - [Firecrawl](https://firecrawl.dev) — optional paid fallback для сложных страниц
 - [Apify](https://apify.com) — optional источник для карт/отзывов, если прямого API нет
@@ -71,6 +72,12 @@ python -m src.main digest
 | `TAVILY_API_KEY` | API-ключ Tavily |
 | `ENABLE_SEARXNG` | Включить self-host SearXNG поиск |
 | `SEARXNG_BASE_URL` | URL SearXNG внутри Docker (`http://searxng:8080`) |
+| `EXA_API_KEY` | Optional API-ключ Exa |
+| `ENABLE_EXA_SEARCH` | Включить Exa как дополнительный web-search provider |
+| `ENABLE_EXA_CONTENTS_FALLBACK` | Использовать Exa Contents как fallback для чтения страниц |
+| `EXA_SEARCH_TYPE` | Тип поиска Exa (`auto`, `fast`, `instant`, `neural`) |
+| `EXA_MAX_AGE_HOURS` | Max cache age для Exa contents/livecrawl |
+| `PROVIDER_METRICS_PATH` | JSONL-файл эффективности источников (`data/provider_effectiveness.jsonl`) |
 | `JINA_READER_BASE_URL` | URL Jina Reader (`https://r.jina.ai` или self-host) |
 | `ENABLE_FIRECRAWL_FALLBACK` | Включить платный Firecrawl fallback (`false` по умолчанию) |
 | `FIRECRAWL_API_KEY` | Optional API-ключ Firecrawl для fallback |
@@ -90,8 +97,17 @@ python -m src.main digest
 - PostgreSQL + SQLAlchemy (async)
 - OpenAI API (GPT-4o-mini)
 - Tavily Search API
+- Exa Search/Contents API (optional, shadow-test friendly)
 - trafilatura + Jina Reader для deep-read URL
 - Firecrawl API как optional fallback
 - Apify API как optional источник
 - aiogram (Telegram)
 - Docker
+
+## Мониторинг эффективности источников
+
+Каждый запуск пишет JSONL snapshot в `PROVIDER_METRICS_PATH` с воронкой по источникам: collected → freshness → dedup → LLM relevant → saved → notified.
+
+```bash
+python scripts/provider_metrics_summary.py --last 50
+```

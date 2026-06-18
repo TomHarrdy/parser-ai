@@ -11,6 +11,8 @@ Uses LangGraph to orchestrate:
 import asyncio
 import json
 import logging
+import os
+import time
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
 from typing import Any, Dict, List, Optional, Tuple
@@ -47,10 +49,13 @@ from src.tools import (
     fetch_instagram_meta_date,
     search_brand_mentions,
     search_monitoring_phrases,
+    search_exa_brand_mentions,
+    search_exa_monitoring_phrases,
     search_searxng_brand_mentions,
     search_searxng_monitoring_phrases,
     search_instagram_profiles,
     scrape_url_with_meta,
+    extract_exa_url,
 )
 from src.tools.firecrawl import extract_first_content_date
 from src.tools.tavily import extract_url
@@ -77,6 +82,7 @@ class PipelineState:
     raw_mentions: List[Dict[str, Any]] = field(default_factory=list)
     new_mentions: List[Dict[str, Any]] = field(default_factory=list)
     analyzed_mentions: List[Dict[str, Any]] = field(default_factory=list)
+    provider_metrics: Dict[str, Dict[str, Any]] = field(default_factory=dict)
     errors: List[str] = field(default_factory=list)
 
 
@@ -140,6 +146,69 @@ def _is_too_old(published_at: Optional[datetime], max_age_days: int) -> bool:
 
 def _has_trusted_source_date(source_name: str, published_at: Optional[datetime]) -> bool:
     return bool(published_at and source_name in TRUSTED_SOURCE_DATE_NAMES)
+
+
+def _ensure_provider_metric(state: PipelineState, source_name: str) -> Dict[str, Any]:
+    source = source_name or "unknown"
+    metric = state.provider_metrics.setdefault(
+        source,
+        {
+            "collected": 0,
+            "freshness_verified": 0,
+            "freshness_skipped": 0,
+            "dedup_new": 0,
+            "dedup_skipped": 0,
+            "analyzed_relevant": 0,
+            "analysis_skipped": 0,
+            "saved": 0,
+            "notified": 0,
+            "errors": 0,
+            "duration_ms": 0,
+        },
+    )
+    return metric
+
+
+def _metric_add(
+    state: PipelineState,
+    source_name: str,
+    key: str,
+    amount: int | float = 1,
+) -> None:
+    metric = _ensure_provider_metric(state, source_name)
+    metric[key] = metric.get(key, 0) + amount
+
+
+def _count_by_source(items: List[Dict[str, Any]]) -> Dict[str, int]:
+    counts: Dict[str, int] = {}
+    for item in items:
+        source = item.get("source_name") or "unknown"
+        counts[source] = counts.get(source, 0) + 1
+    return counts
+
+
+def _write_provider_metrics_snapshot(state: PipelineState) -> None:
+    path = state.settings.provider_metrics_path
+    if not path:
+        return
+
+    payload = {
+        "run_at": datetime.now(timezone.utc).isoformat(),
+        "total": {
+            "collected": sum(m.get("collected", 0) for m in state.provider_metrics.values()),
+            "freshness_verified": sum(m.get("freshness_verified", 0) for m in state.provider_metrics.values()),
+            "dedup_new": sum(m.get("dedup_new", 0) for m in state.provider_metrics.values()),
+            "analyzed_relevant": sum(m.get("analyzed_relevant", 0) for m in state.provider_metrics.values()),
+            "saved": sum(m.get("saved", 0) for m in state.provider_metrics.values()),
+            "notified": sum(m.get("notified", 0) for m in state.provider_metrics.values()),
+            "errors": len(state.errors),
+        },
+        "providers": state.provider_metrics,
+    }
+
+    os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
+    with open(path, "a", encoding="utf-8") as fh:
+        fh.write(json.dumps(payload, ensure_ascii=False, sort_keys=True) + "\n")
 
 
 # ── Node: Collect ────────────────────────────────────────
@@ -410,6 +479,108 @@ async def _collect_searxng_phrases(settings) -> Tuple[List[RawMention], List[str
         )
     except Exception as e:
         msg = f"SearXNG phrases error [{type(e).__name__}]: {e}"
+        logger.error(msg)
+        errors.append(msg)
+    return raw, errors
+
+
+async def _collect_exa_brand(settings) -> Tuple[List[RawMention], List[str]]:
+    """Collect brand mentions from Exa Search."""
+    raw: List[RawMention] = []
+    errors: List[str] = []
+    max_age = settings.max_article_age_days
+    source = "exa"
+
+    if not (settings.enable_exa_search and settings.exa_api_key and settings.company_name):
+        return raw, errors
+
+    watermark = await _load_watermark(source)
+    cutoff = _watermark_cutoff(
+        watermark,
+        overlap_minutes=settings.watermark_overlap_minutes,
+        fallback_age_days=max_age,
+    )
+    logger.info("Exa brand watermark cutoff: %s (watermark=%s)", cutoff, watermark)
+
+    try:
+        results = await search_exa_brand_mentions(
+            api_key=settings.exa_api_key,
+            brand=settings.company_name,
+            keywords=settings.keyword_list,
+            location=settings.monitoring_location,
+            search_type=settings.exa_search_type,
+            max_age_hours=settings.exa_max_age_hours,
+        )
+        skipped = 0
+        for r in results:
+            pub = _parse_published_date(r.get("published_date"))
+            if _is_too_old(pub, max_age) or _is_before_watermark(pub, cutoff):
+                skipped += 1
+                continue
+            raw.append(RawMention(
+                url=r.get("url"),
+                text=r.get("content") or r.get("raw_content", ""),
+                source_type=SourceType.web,
+                source_name=source,
+                published_at=pub,
+            ))
+        logger.info(
+            "Exa (brand): %d results, %d skipped (before watermark cutoff)",
+            len(results), skipped,
+        )
+    except Exception as e:
+        msg = f"Exa brand search error [{type(e).__name__}]: {e}"
+        logger.error(msg)
+        errors.append(msg)
+    return raw, errors
+
+
+async def _collect_exa_phrases(settings) -> Tuple[List[RawMention], List[str]]:
+    """Collect phrase-based mentions from Exa Search."""
+    raw: List[RawMention] = []
+    errors: List[str] = []
+    max_age = settings.max_article_age_days
+    source = "exa_phrase"
+
+    if not (settings.enable_exa_search and settings.exa_api_key and settings.search_phrase_list):
+        return raw, errors
+
+    watermark = await _load_watermark(source)
+    cutoff = _watermark_cutoff(
+        watermark,
+        overlap_minutes=settings.watermark_overlap_minutes,
+        fallback_age_days=max_age,
+    )
+    logger.info("Exa phrases watermark cutoff: %s (watermark=%s)", cutoff, watermark)
+
+    try:
+        results = await search_exa_monitoring_phrases(
+            api_key=settings.exa_api_key,
+            phrases=settings.search_phrase_list,
+            location=settings.monitoring_location,
+            brand=settings.company_name or None,
+            search_type=settings.exa_search_type,
+            max_age_hours=settings.exa_max_age_hours,
+        )
+        skipped = 0
+        for r in results:
+            pub = _parse_published_date(r.get("published_date"))
+            if _is_too_old(pub, max_age) or _is_before_watermark(pub, cutoff):
+                skipped += 1
+                continue
+            raw.append(RawMention(
+                url=r.get("url"),
+                text=r.get("content") or r.get("raw_content", ""),
+                source_type=SourceType.web,
+                source_name=source,
+                published_at=pub,
+            ))
+        logger.info(
+            "Exa (phrases): %d results, %d skipped (before watermark cutoff)",
+            len(results), skipped,
+        )
+    except Exception as e:
+        msg = f"Exa phrases error [{type(e).__name__}]: {e}"
         logger.error(msg)
         errors.append(msg)
     return raw, errors
@@ -731,20 +902,30 @@ async def collect_mentions(state: PipelineState) -> PipelineState:
     settings = state.settings
 
     # Run all sources concurrently — each returns (List[RawMention], List[str])
-    results = await asyncio.gather(
-        _collect_tavily_brand(settings),
-        _collect_tavily_phrases(settings),
-        _collect_searxng_brand(settings),
-        _collect_searxng_phrases(settings),
-        _collect_vk(settings),
-        _collect_vk_direct(settings),
-        _collect_instagram_direct(settings),
-        _collect_yandex_maps(settings),
-        _collect_comment_watchlist(settings),
+    collectors = (
+        ("tavily", _collect_tavily_brand(settings)),
+        ("tavily_phrase", _collect_tavily_phrases(settings)),
+        ("searxng", _collect_searxng_brand(settings)),
+        ("searxng_phrase", _collect_searxng_phrases(settings)),
+        ("exa", _collect_exa_brand(settings)),
+        ("exa_phrase", _collect_exa_phrases(settings)),
+        ("vk", _collect_vk(settings)),
+        ("vk", _collect_vk_direct(settings)),
+        ("instagram", _collect_instagram_direct(settings)),
+        ("yandex_maps", _collect_yandex_maps(settings)),
+        ("comment_watchlist", _collect_comment_watchlist(settings)),
     )
+    started_at = time.monotonic()
+    results = await asyncio.gather(*(coro for _, coro in collectors))
+    elapsed_ms = int((time.monotonic() - started_at) * 1000)
 
     raw: List[RawMention] = []
-    for batch_raw, batch_errors in results:
+    for (source_name, _), (batch_raw, batch_errors) in zip(collectors, results):
+        metric_source = batch_raw[0].source_name if batch_raw else source_name
+        _metric_add(state, metric_source, "collected", len(batch_raw))
+        _metric_add(state, metric_source, "errors", len(batch_errors))
+        if batch_raw:
+            _metric_add(state, metric_source, "duration_ms", elapsed_ms // max(len(collectors), 1))
         raw.extend(batch_raw)
         state.errors.extend(batch_errors)
 
@@ -820,6 +1001,27 @@ async def _verify_single_freshness(
             except Exception:
                 pass
 
+        if (
+            url
+            and settings.enable_exa_contents_fallback
+            and settings.exa_api_key
+            and (len(text) < 200 or published_at is None)
+        ):
+            try:
+                extracted, exa_pub_date = await extract_exa_url(
+                    settings.exa_api_key,
+                    url,
+                    max_age_hours=settings.exa_max_age_hours,
+                )
+                if extracted and len(extracted) > len(text):
+                    text = extracted
+                    m["text"] = text
+                    logger.info("Freshness verify Exa contents: %s", url)
+                if exa_pub_date and published_at is None:
+                    published_at = _coerce_published_at(exa_pub_date)
+            except Exception as e:
+                logger.debug("Exa contents fallback failed for %s: %s", url, e)
+
         if published_at:
             m["published_at"] = published_at.isoformat()
 
@@ -857,6 +1059,7 @@ async def _verify_single_freshness(
 
 async def verify_freshness(state: PipelineState) -> PipelineState:
     """Step 1.5: verify source dates before dedup and LLM analysis."""
+    before_counts = _count_by_source(state.raw_mentions)
     semaphore = asyncio.Semaphore(5)
     tasks = [
         _verify_single_freshness(m, state.settings, semaphore)
@@ -873,6 +1076,12 @@ async def verify_freshness(state: PipelineState) -> PipelineState:
             continue
         if raw is not None:
             verified.append(raw)
+
+    after_counts = _count_by_source(verified)
+    for source_name, before in before_counts.items():
+        after = after_counts.get(source_name, 0)
+        _metric_add(state, source_name, "freshness_verified", after)
+        _metric_add(state, source_name, "freshness_skipped", before - after)
 
     logger.info(
         "Freshness verify: %d raw → %d verified (%d skipped)",
@@ -981,6 +1190,12 @@ async def deduplicate(state: PipelineState) -> PipelineState:
 
     skipped = len(state.raw_mentions) - len(new)
     updates = sum(1 for m in new if m.get("is_content_update"))
+    before_counts = _count_by_source(state.raw_mentions)
+    after_counts = _count_by_source(new)
+    for source_name, before in before_counts.items():
+        after = after_counts.get(source_name, 0)
+        _metric_add(state, source_name, "dedup_new", after)
+        _metric_add(state, source_name, "dedup_skipped", before - after)
     logger.info(
         "Dedup: %d raw → %d new (%d fresh, %d content updates, %d skipped)",
         len(state.raw_mentions), len(new),
@@ -1274,6 +1489,29 @@ async def _analyze_single(
             except Exception:
                 pass
 
+        if (
+            url
+            and settings.enable_exa_contents_fallback
+            and settings.exa_api_key
+            and (len(text) < 200 or published_at is None)
+        ):
+            try:
+                extracted, exa_pub_date = await extract_exa_url(
+                    settings.exa_api_key,
+                    url,
+                    max_age_hours=settings.exa_max_age_hours,
+                )
+                if extracted and len(extracted) > len(text):
+                    text = extracted
+                    m["text"] = text
+                    logger.info("Exa contents fallback: %s", url)
+                if exa_pub_date and published_at is None:
+                    published_at = _coerce_published_at(exa_pub_date)
+                    if published_at:
+                        m["published_at"] = published_at.isoformat()
+            except Exception as e:
+                logger.debug("Exa contents fallback failed for %s: %s", url, e)
+
         # Official sources: skip age/freshness gates entirely.
         # The watermark in the collector already guarantees we only see new content.
         # Applying _is_too_old or decide_freshness here would wrongly drop comments
@@ -1415,6 +1653,13 @@ async def analyze_mentions(state: PipelineState) -> PipelineState:
         if mention is not None:
             analyzed.append(mention)
 
+    before_counts = _count_by_source(state.new_mentions)
+    after_counts = _count_by_source(analyzed)
+    for source_name, before in before_counts.items():
+        after = after_counts.get(source_name, 0)
+        _metric_add(state, source_name, "analyzed_relevant", after)
+        _metric_add(state, source_name, "analysis_skipped", before - after)
+
     logger.info(
         "Analysis: %d processed, %d relevant, %d irrelevant/skipped",
         len(state.new_mentions),
@@ -1438,6 +1683,7 @@ async def save_and_notify(state: PipelineState) -> PipelineState:
 
     settings = state.settings
     saved_mentions: List[Mention] = []
+    saved_pairs: List[Tuple[Mention, Dict[str, Any]]] = []
 
     async for session in get_session():
         for m in state.analyzed_mentions:
@@ -1499,6 +1745,8 @@ async def save_and_notify(state: PipelineState) -> PipelineState:
                 session.add(mention)
                 await session.commit()
                 saved_mentions.append(mention)
+                saved_pairs.append((mention, m))
+                _metric_add(state, m.get("source_name") or "unknown", "saved")
             except Exception as db_err:
                 await session.rollback()
                 logger.warning(
@@ -1513,7 +1761,7 @@ async def save_and_notify(state: PipelineState) -> PipelineState:
     # so Telegram can format them differently
     content_update_mention_ids = {
         saved.id
-        for saved, m in zip(saved_mentions, state.analyzed_mentions)
+        for saved, m in saved_pairs
         if m.get("is_content_update")
     }
 
@@ -1525,10 +1773,11 @@ async def save_and_notify(state: PipelineState) -> PipelineState:
 
         # Mark sent alerts in DB
         async for session in get_session():
-            for mention, sent in zip(saved_mentions, alert_results):
+            for (mention, original), sent in zip(saved_pairs, alert_results):
                 if sent:
                     mention.is_alert_sent = True
                     session.add(mention)
+                    _metric_add(state, original.get("source_name") or "unknown", "notified")
             await session.commit()
 
     # ── Update high-water marks ──────────────────────────
@@ -1547,6 +1796,12 @@ async def save_and_notify(state: PipelineState) -> PipelineState:
             logger.info("Watermarks updated for sources: %s", sorted(sources_in_run))
         except Exception as e:
             logger.warning("Failed to update watermarks: %s", e)
+
+    try:
+        _write_provider_metrics_snapshot(state)
+        logger.info("Provider effectiveness metrics written to %s", settings.provider_metrics_path)
+    except Exception as e:
+        logger.warning("Failed to write provider effectiveness metrics: %s", e)
 
     return state
 

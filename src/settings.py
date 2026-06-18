@@ -52,6 +52,15 @@ class Settings(BaseSettings):
     jina_reader_base_url: str = Field(default="https://r.jina.ai", alias="JINA_READER_BASE_URL")
     enable_searxng: bool = Field(default=False, alias="ENABLE_SEARXNG")
     searxng_base_url: str = Field(default="http://searxng:8080", alias="SEARXNG_BASE_URL")
+    exa_api_key: str = Field(default="", alias="EXA_API_KEY")
+    enable_exa_search: bool = Field(default=False, alias="ENABLE_EXA_SEARCH")
+    enable_exa_contents_fallback: bool = Field(default=False, alias="ENABLE_EXA_CONTENTS_FALLBACK")
+    exa_search_type: str = Field(default="auto", alias="EXA_SEARCH_TYPE")
+    exa_max_age_hours: int = Field(default=24, alias="EXA_MAX_AGE_HOURS")
+    provider_metrics_path: str = Field(
+        default="data/provider_effectiveness.jsonl",
+        alias="PROVIDER_METRICS_PATH",
+    )
 
     # ── VK Direct (альтернатива Apify) ────────────────
     vk_access_token: str = Field(default="", alias="VK_ACCESS_TOKEN")
